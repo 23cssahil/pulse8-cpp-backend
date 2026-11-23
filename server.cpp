@@ -1,414 +1,374 @@
-#include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
+#include <boost/asio/strand.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <openssl/hmac.h>
-#include <openssl/rand.h>
-
-#include <algorithm>
-#include <chrono>
-#include <cmath>
-#include <cstdlib>
-#include <ctime>
-#include <iomanip>
+#include <openssl/sha.h>
 #include <iostream>
+#include <string>
+#include <vector>
+#include <unordered_map>
 #include <memory>
 #include <mutex>
+#include <chrono>
+#include <cmath>
+#include <algorithm>
+#include <iomanip>
 #include <sstream>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
+#include <random>
+#include <cstdlib>
 
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
 namespace net = boost::asio;
 using tcp = boost::asio::ip::tcp;
 
-// ============================================================================
-// CONFIGURATION CONSTANTS
-// ============================================================================
-constexpr double ENTRY_FEE_INR = 10.0;
-constexpr double COMPANY_COMMISSION_RATE = 0.20; // 20% fixed cut
-constexpr double DISTRIBUTABLE_POOL_RATE = 0.80; // 80% prize pool
-constexpr int TICK_INTERVAL_MS = 50;             // 20 ticks per second
-constexpr int WAITING_DURATION_MS = 6000;        // 6 sec lobby join window
-constexpr bool BYPASS_8PM_WINDOW_FOR_TESTING = true; // Set false for strict 8-9 PM IST
+// --- ECONOMIC & POOL CONSTANTS ---
+constexpr double MIN_BET = 10.0;
+constexpr double MAX_BET_CAP_RATIO = 0.05;      // Dynamic 5% Max Bet Cap of Total Pool
+constexpr double COMMISSION_RATE = 0.20;        // 20% Company Cut
+constexpr double POOL_PAYOUT_RATE = 0.80;       // 80% Distributable Pool
+constexpr int WAITING_DURATION_MS = 7000;       // 7s Betting Window
+constexpr int CRASH_DISPLAY_MS = 4500;          // 4.5s Leaderboard View
+constexpr int TICK_INTERVAL_MS = 50;            // 50ms Server Tick (20 FPS)
 
-// ============================================================================
-// DATA STRUCTURES
-// ============================================================================
-enum class RoundState {
-    WINDOW_CLOSED,
-    WAITING,
-    FLYING,
-    CRASHED
-};
+enum class GameState { WAITING, FLYING, CRASHED };
 
 struct PlayerEntry {
-    std::string player_id;
-    double entry_fee = ENTRY_FEE_INR;
-    bool cashed_out = false;
-    double cashout_multiplier = 0.0;
-    int64_t cashout_timestamp_us = 0; // Microsecond precision for tie-breaking
-    int final_rank = 0;
-    double prize_won = 0.0;
+    std::string playerId;
+    double betAmount = 0.0;
+    bool cashedOut = false;
+    double cashoutMultiplier = 0.0;
+    int64_t cashoutTimeMicros = 0;
+    double score = 0.0;
+    double prizeWon = 0.0;
+    int rank = 0;
 };
 
-struct CashoutRecord {
-    std::string player_id;
-    double multiplier;
-    int64_t timestamp_us;
-
-    // Descending by multiplier, then Ascending by microsecond timestamp
-    bool operator<(const CashoutRecord& other) const {
-        if (std::abs(multiplier - other.multiplier) > 1e-6) {
-            return multiplier > other.multiplier;
-        }
-        return timestamp_us < other.timestamp_us;
+// --- CRYPTOGRAPHIC PROVABLY FAIR ENGINE ---
+std::string generateRandomHex(size_t bytes = 32) {
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<uint64_t> dis;
+    std::ostringstream oss;
+    for (size_t i = 0; i < bytes / 8; ++i) {
+        oss << std::hex << std::setw(16) << std::setfill('0') << dis(gen);
     }
-};
+    return oss.str();
+}
 
-// ============================================================================
-// CRYPTOGRAPHIC PROVABLY FAIR ENGINE (HMAC-SHA256)
-// ============================================================================
-class ProvablyFair {
-public:
-    static std::string generate_hex_seed(size_t bytes = 32) {
-        std::vector<unsigned char> buf(bytes);
-        RAND_bytes(buf.data(), static_cast<int>(bytes));
-        std::ostringstream oss;
-        for (unsigned char b : buf) {
-            oss << std::hex << std::setw(2) << std::setfill('0') << (int)b;
-        }
-        return oss.str();
+std::string sha256Hex(const std::string& input) {
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(input.c_str()), input.size(), hash);
+    std::ostringstream oss;
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
     }
+    return oss.str();
+}
 
-    static std::string hmac_sha256(const std::string& key, const std::string& data) {
-        unsigned char hash[EVP_MAX_MD_SIZE];
-        unsigned int len = 0;
-        HMAC(EVP_sha256(), key.c_str(), static_cast<int>(key.size()),
-             reinterpret_cast<const unsigned char*>(data.c_str()), data.size(), hash, &len);
+double computeCryptoCrashPoint(const std::string& serverSeed, uint64_t roundId) {
+    std::string msg = "pulse8-round-" + std::to_string(roundId);
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digestLen = 0;
 
-        std::ostringstream oss;
-        for (unsigned int i = 0; i < len; ++i) {
-            oss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
-        }
-        return oss.str();
+    HMAC(EVP_sha256(),
+         serverSeed.c_str(), static_cast<int>(serverSeed.size()),
+         reinterpret_cast<const unsigned char*>(msg.c_str()), msg.size(),
+         digest, &digestLen);
+
+    uint64_t h = 0;
+    for (int i = 0; i < 8; ++i) {
+        h = (h << 8) | digest[i];
     }
 
-    // Derives theoretical max crash multiplier from first 52 bits of HMAC-SHA256
-    static double compute_crash_point(const std::string& server_seed,
-                                      const std::string& client_seed,
-                                      uint64_t nonce) {
-        std::string msg = client_seed + ":" + std::to_string(nonce);
-        std::string hex_hash = hmac_sha256(server_seed, msg);
+    if (h % 25 == 0) return 1.00; // 4% instant crash edge
+    double e = static_cast<double>(h >> 11) / static_cast<double>(1ULL << 53);
+    double raw = 0.99 / (1.0 - e);
+    return std::min(100.0, std::max(1.01, std::floor(raw * 100.0) / 100.0));
+}
 
-        // Take top 13 hex chars (52 bits)
-        uint64_t h = std::stoull(hex_hash.substr(0, 13), nullptr, 16);
-        constexpr uint64_t E = (1ULL << 52);
+class Session;
 
-        // 4% house instant-bust edge check
-        if (h % 25 == 0) return 1.00;
-
-        double raw = (100.0 * E - h) / (E - h) / 100.0;
-        return std::min(250.0, std::max(1.01, std::floor(raw * 100.0) / 100.0));
-    }
-};
-
-// ============================================================================
-// PARI-MUTUEL POOL & PREFIX-SUM RANKING ENGINE
-// ============================================================================
-class Session; // Forward declaration
-
+// --- CENTRAL GAME ENGINE ---
 class GameEngine {
 public:
-    GameEngine() {
-        client_seed_ = "pulse8_public_client_seed_v1";
-        prepare_next_round();
+    GameEngine(net::io_context& ioc) : timer_(ioc) {
+        prepareNextRound();
     }
 
-    void join_session(std::shared_ptr<Session> s) {
+    void start() {
+        scheduleTick();
+    }
+
+    void joinSession(std::shared_ptr<Session> s) {
         std::lock_guard<std::mutex> lock(mtx_);
-        sessions_.insert(s);
+        sessions_.push_back(s);
     }
 
-    void leave_session(std::shared_ptr<Session> s) {
+    void leaveSession(std::shared_ptr<Session> s) {
         std::lock_guard<std::mutex> lock(mtx_);
-        sessions_.erase(s);
+        sessions_.erase(std::remove(sessions_.begin(), sessions_.end(), s), sessions_.end());
     }
 
-    // Check if current IST time is between 20:00 (8 PM) and 21:00 (9 PM)
-    bool is_live_window_ist() const {
-        if (BYPASS_8PM_WINDOW_FOR_TESTING) return true;
-        auto now = std::chrono::system_clock::now();
-        std::time_t utc_now = std::chrono::system_clock::to_time_t(now);
-        std::time_t ist_now = utc_now + (5 * 3600 + 30 * 60); // UTC + 5:30
-        std::tm* ist_tm = std::gmtime(&ist_now);
-        return (ist_tm->tm_hour == 20); // 20:00:00 to 20:59:59 IST
+    // Dynamic 5% Max Bet Limit (min ₹10 so early players can seed the pool)
+    double computeDynamicMaxBet() const {
+        double cap = std::floor(totalPool_ * MAX_BET_CAP_RATIO);
+        return std::max(MIN_BET, cap);
     }
 
-    // Handle incoming JSON-like commands from WebSocket clients
-    std::string handle_client_message(const std::string& msg) {
+    std::string handleCommand(const std::string& rawMsg) {
         std::lock_guard<std::mutex> lock(mtx_);
 
-        // Simple lightweight parser: ACTION|PLAYER_ID
-        size_t sep = msg.find('|');
-        if (sep == std::string::npos) return R"({"type":"ERROR","msg":"Invalid format"})";
-
-        std::string action = msg.substr(0, sep);
-        std::string player_id = msg.substr(sep + 1);
-
-        if (action == "JOIN") {
-            if (state_ != RoundState::WAITING) {
-                return R"({"type":"ERROR","msg":"Round already in flight. Wait for next round."})";
+        // Protocol: JOIN|playerId|amount
+        if (rawMsg.rfind("JOIN|", 0) == 0) {
+            std::string rest = rawMsg.substr(5);
+            size_t sep = rest.find('|');
+            if (sep == std::string::npos) {
+                return R"({"type":"ERROR","msg":"Invalid JOIN format"})";
             }
-            if (players_.count(player_id)) {
-                return R"({"type":"ERROR","msg":"Already joined this round."})";
-            }
-            players_[player_id] = PlayerEntry{player_id, ENTRY_FEE_INR, false, 0.0, 0, 0, 0.0};
-            recalculate_pools();
 
-            std::ostringstream res;
-            res << R"({"type":"JOIN_OK","playerId":")" << player_id
-                << R"(","players":)" << players_.size()
-                << R"(,"distributablePool":)" << distributable_pool_ << "}";
-            return res.str();
+            std::string playerId = rest.substr(0, sep);
+            double betAmount = 0.0;
+            try {
+                betAmount = std::stod(rest.substr(sep + 1));
+            } catch (...) {
+                return R"({"type":"ERROR","msg":"Invalid bet amount"})";
+            }
+
+            if (state_ != GameState::WAITING) {
+                return R"({"type":"ERROR","msg":"Round already in flight! Wait for next pool."})";
+            }
+            if (players_.count(playerId)) {
+                return R"({"type":"ERROR","msg":"Already joined this pool."})";
+            }
+
+            double allowedMax = computeDynamicMaxBet();
+            if (betAmount < MIN_BET) {
+                return R"({"type":"ERROR","msg":"Minimum bet is ₹10."})";
+            }
+            if (betAmount > allowedMax) {
+                std::ostringstream err;
+                err << R"({"type":"ERROR","msg":"Exceeds 5% Dynamic Pool Cap! Current Max: ₹)"
+                    << std::fixed << std::setprecision(0) << allowedMax << R"("})";
+                return err.str();
+            }
+
+            PlayerEntry entry;
+            entry.playerId = playerId;
+            entry.betAmount = betAmount;
+            players_[playerId] = entry;
+            totalPool_ += betAmount;
+
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(2)
+                << R"({"type":"JOIN_OK","playerId":")" << playerId
+                << R"(","betAmount":)" << betAmount
+                << R"(,"totalPool":)" << totalPool_
+                << R"(,"dynamicMaxBet":)" << computeDynamicMaxBet() << "}";
+            return oss.str();
         }
 
-        if (action == "CASHOUT") {
-            if (state_ != RoundState::FLYING) {
+        // Protocol: CASHOUT|playerId
+        if (rawMsg.rfind("CASHOUT|", 0) == 0) {
+            std::string playerId = rawMsg.substr(8);
+            if (state_ != GameState::FLYING) {
                 return R"({"type":"ERROR","msg":"Plane is not flying."})";
             }
-            auto it = players_.find(player_id);
-            if (it == players_.end() || it->second.cashed_out) {
-                return R"({"type":"ERROR","msg":"Not eligible for cashout."})";
+            auto it = players_.find(playerId);
+            if (it == players_.end()) {
+                return R"({"type":"ERROR","msg":"You did not join this round."})";
+            }
+            if (it->second.cashedOut) {
+                return R"({"type":"ERROR","msg":"Already cashed out."})";
             }
 
-            // Capture exact microsecond timestamp
-            int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                 std::chrono::steady_clock::now().time_since_epoch())
-                                 .count();
+            auto nowMicros = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
 
-            double claimed_mult = current_multiplier_;
-            double theoretical_liability = ENTRY_FEE_INR * claimed_mult;
+            it->second.cashedOut = true;
+            it->second.cashoutMultiplier = currentMultiplier_;
+            it->second.cashoutTimeMicros = nowMicros;
+            it->second.score = it->second.betAmount * currentMultiplier_;
 
-            // DYNAMIC POOL-LIMIT SAFETY CAP CHECK
-            if (running_claimed_liability_ + theoretical_liability >= distributable_pool_ &&
-                distributable_pool_ > 0.0) {
-                // Force crash immediately before liability exceeds 80% pool!
-                force_crash_locked("POOL_CAP_REACHED");
-                return R"({"type":"CRASHED_BEFORE_CASHOUT","msg":"Pool safety cap triggered!"})";
-            }
-
-            running_claimed_liability_ += theoretical_liability;
-            it->second.cashed_out = true;
-            it->second.cashout_multiplier = claimed_mult;
-            it->second.cashout_timestamp_us = now_us;
-
-            cashouts_.push_back(CashoutRecord{player_id, claimed_mult, now_us});
-
-            std::ostringstream res;
-            res << R"({"type":"CASHOUT_OK","playerId":")" << player_id
-                << R"(","multiplier":)" << std::fixed << std::setprecision(2) << claimed_mult
-                << R"(,"liveCashouts":)" << cashouts_.size() << "}";
-            return res.str();
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(2)
+                << R"({"type":"CASHOUT_OK","playerId":")" << playerId
+                << R"(","multiplier":)" << currentMultiplier_
+                << R"(,"score":)" << it->second.score << "}";
+            return oss.str();
         }
 
         return R"({"type":"ERROR","msg":"Unknown command"})";
     }
 
-    // Called every 50ms by Boost.Asio steady_timer
-    std::string tick() {
-        std::lock_guard<std::mutex> lock(mtx_);
-        auto now = std::chrono::steady_clock::now();
-
-        if (!is_live_window_ist()) {
-            state_ = RoundState::WINDOW_CLOSED;
-            return R"({"type":"WINDOW_CLOSED","msg":"Pulse8 is live daily 8:00 PM - 9:00 PM IST"})";
-        }
-
-        if (state_ == RoundState::WAITING) {
-            auto elapsed_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(now - phase_start_time_).count();
-
-            if (elapsed_ms >= WAITING_DURATION_MS) {
-                // Transition WAITING -> FLYING
-                state_ = RoundState::FLYING;
-                phase_start_time_ = now;
-                current_multiplier_ = 1.00;
-                running_claimed_liability_ = 0.0;
-                cashouts_.clear();
-
-                std::ostringstream oss;
-                oss << R"({"type":"START","roundId":)" << nonce_
-                    << R"(,"players":)" << players_.size()
-                    << R"(,"totalPool":)" << total_pool_
-                    << R"(,"companyCommission":)" << company_commission_
-                    << R"(,"prizePool":)" << distributable_pool_
-                    << R"(,"hashCommitment":")" << server_seed_hash_ << R"("})";
-                return oss.str();
-            } else {
-                long remaining = WAITING_DURATION_MS - elapsed_ms;
-                std::ostringstream oss;
-                oss << R"({"type":"WAITING","remainingMs":)" << remaining
-                    << R"(,"players":)" << players_.size()
-                    << R"(,"prizePool":)" << distributable_pool_ << "}";
-                return oss.str();
-            }
-        }
-
-        if (state_ == RoundState::FLYING) {
-            double elapsed_sec =
-                std::chrono::duration_cast<std::chrono::milliseconds>(now - phase_start_time_).count() /
-                1000.0;
-
-            // Exponential growth curve: M(t) = e^(0.098 * t)
-            current_multiplier_ = std::floor(std::exp(0.098 * elapsed_sec) * 100.0) / 100.0;
-
-            // Trigger A: Cryptographic Crash Point Reached
-            if (current_multiplier_ >= crypto_crash_point_) {
-                current_multiplier_ = crypto_crash_point_;
-                return force_crash_locked("CRYPTO_CRASH_POINT");
-            }
-
-            std::ostringstream oss;
-            oss << R"({"type":"TICK","multiplier":)" << std::fixed << std::setprecision(2)
-                << current_multiplier_ << R"(,"cashedOutCount":)" << cashouts_.size() << "}";
-            return oss.str();
-        }
-
-        if (state_ == RoundState::CRASHED) {
-            auto elapsed_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(now - phase_start_time_).count();
-            if (elapsed_ms >= 3500) {
-                prepare_next_round();
-            }
-        }
-
-        return "";
-    }
-
-    std::vector<std::shared_ptr<Session>> get_sessions_snapshot() {
-        std::lock_guard<std::mutex> lock(mtx_);
-        return std::vector<std::shared_ptr<Session>>(sessions_.begin(), sessions_.end());
-    }
-
 private:
-    std::mutex mtx_;
-    std::unordered_set<std::shared_ptr<Session>> sessions_;
-
-    RoundState state_ = RoundState::WAITING;
-    std::chrono::steady_clock::time_point phase_start_time_;
-
-    uint64_t nonce_ = 0;
-    std::string server_seed_;
-    std::string server_seed_hash_;
-    std::string client_seed_;
-    double crypto_crash_point_ = 1.00;
-    double current_multiplier_ = 1.00;
-
-    std::unordered_map<std::string, PlayerEntry> players_;
-    std::vector<CashoutRecord> cashouts_;
-
-    double total_pool_ = 0.0;
-    double company_commission_ = 0.0;
-    double distributable_pool_ = 0.0;
-    double running_claimed_liability_ = 0.0;
-
-    void recalculate_pools() {
-        total_pool_ = players_.size() * ENTRY_FEE_INR;
-        company_commission_ = total_pool_ * COMPANY_COMMISSION_RATE;
-        distributable_pool_ = total_pool_ * DISTRIBUTABLE_POOL_RATE;
-    }
-
-    void prepare_next_round() {
-        nonce_++;
+    void prepareNextRound() {
+        roundId_++;
+        state_ = GameState::WAITING;
         players_.clear();
-        cashouts_.clear();
-        recalculate_pools();
+        totalPool_ = 0.0;
+        currentMultiplier_ = 1.00;
+        phaseStart_ = std::chrono::steady_clock::now();
 
-        server_seed_ = ProvablyFair::generate_hex_seed();
-        server_seed_hash_ = ProvablyFair::hmac_sha256(server_seed_, "COMMITMENT");
-        crypto_crash_point_ = ProvablyFair::compute_crash_point(server_seed_, client_seed_, nonce_);
-
-        state_ = RoundState::WAITING;
-        phase_start_time_ = std::chrono::steady_clock::now();
-        current_multiplier_ = 1.00;
+        serverSeed_ = generateRandomHex(32);
+        hashCommitment_ = sha256Hex(serverSeed_);
+        cryptoCrashPoint_ = computeCryptoCrashPoint(serverSeed_, roundId_);
     }
 
-    // Build Asymmetric Tiered Prefix Sum Array & Settle Winners
-    std::string force_crash_locked(const std::string& reason) {
-        state_ = RoundState::CRASHED;
-        phase_start_time_ = std::chrono::steady_clock::now();
-
-        // 1. Sort winners by (Multiplier DESC, Microsecond Timestamp ASC)
-        std::sort(cashouts_.begin(), cashouts_.end());
-
-        size_t W = cashouts_.size();
-        if (W > 0 && distributable_pool_ > 0.0) {
-            // 2. Build Asymmetric Weights (Top ranks get exponentially larger share)
-            std::vector<double> weights(W, 0.0);
-            double weight_sum = 0.0;
-            for (size_t i = 0; i < W; ++i) {
-                // Zipf/Asymmetric curve: Rank 1 gets highest share, tapering down smoothly
-                weights[i] = 1.0 / std::pow(static_cast<double>(i + 1), 0.75);
-                weight_sum += weights[i];
+    void scheduleTick() {
+        timer_.expires_after(std::chrono::milliseconds(TICK_INTERVAL_MS));
+        timer_.async_wait([this](beast::error_code ec) {
+            if (!ec) {
+                onTick();
+                scheduleTick();
             }
+        });
+    }
 
-            // 3. Build Prefix Sum Array P[0..W] of exact INR prize allocations
-            std::vector<double> prefix_sum(W + 1, 0.0);
-            for (size_t i = 0; i < W; ++i) {
-                double slot_prize = (weights[i] / weight_sum) * distributable_pool_;
-                prefix_sum[i + 1] = prefix_sum[i] + slot_prize;
+    void onTick() {
+        std::string broadcastMsg;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            auto now = std::chrono::steady_clock::now();
+            auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - phaseStart_).count();
+
+            if (state_ == GameState::WAITING) {
+                long remaining = std::max(0L, static_cast<long>(WAITING_DURATION_MS - elapsedMs));
+                if (remaining == 0) {
+                    state_ = GameState::FLYING;
+                    phaseStart_ = now;
+                    currentMultiplier_ = 1.00;
+
+                    double commission = totalPool_ * COMMISSION_RATE;
+                    double distributablePool = totalPool_ * POOL_PAYOUT_RATE;
+
+                    std::ostringstream oss;
+                    oss << std::fixed << std::setprecision(2)
+                        << R"({"type":"START","roundId":)" << roundId_
+                        << R"(,"players":)" << players_.size()
+                        << R"(,"totalPool":)" << totalPool_
+                        << R"(,"companyCommission":)" << commission
+                        << R"(,"prizePool":)" << distributablePool
+                        << R"(,"hashCommitment":")" << hashCommitment_ << R"("})";
+                    broadcastMsg = oss.str();
+                } else {
+                    std::ostringstream oss;
+                    oss << std::fixed << std::setprecision(2)
+                        << R"({"type":"WAITING","roundId":)" << roundId_
+                        << R"(,"remainingMs":)" << remaining
+                        << R"(,"players":)" << players_.size()
+                        << R"(,"totalPool":)" << totalPool_
+                        << R"(,"prizePool":)" << (totalPool_ * POOL_PAYOUT_RATE)
+                        << R"(,"dynamicMaxBet":)" << computeDynamicMaxBet() << "}";
+                    broadcastMsg = oss.str();
+                }
             }
+            else if (state_ == GameState::FLYING) {
+                double elapsedSec = elapsedMs / 1000.0;
+                currentMultiplier_ = std::floor(std::exp(0.068 * elapsedSec * 1.45) * 100.0) / 100.0;
 
-            // 4. Tie-Breaking via Prefix Sum Range Averaging [L..R]
-            size_t i = 0;
-            while (i < W) {
-                size_t j = i;
-                while (j + 1 < W &&
-                       std::abs(cashouts_[j + 1].multiplier - cashouts_[i].multiplier) < 1e-6 &&
-                       cashouts_[j + 1].timestamp_us == cashouts_[i].timestamp_us) {
-                    j++;
+                if (currentMultiplier_ >= cryptoCrashPoint_) {
+                    broadcastMsg = settleAndCrash(cryptoCrashPoint_);
+                } else {
+                    std::ostringstream oss;
+                    oss << std::fixed << std::setprecision(2)
+                        << R"({"type":"TICK","roundId":)" << roundId_
+                        << R"(,"multiplier":)" << currentMultiplier_ << "}";
+                    broadcastMsg = oss.str();
                 }
-
-                // Exact split across tied range [i, j] using Prefix Sum
-                double range_total = prefix_sum[j + 1] - prefix_sum[i];
-                double equal_prize = std::floor((range_total / (j - i + 1)) * 100.0) / 100.0;
-
-                for (size_t k = i; k <= j; ++k) {
-                    auto& p = players_[cashouts_[k].player_id];
-                    p.final_rank = static_cast<int>(i + 1);
-                    p.prize_won = equal_prize;
+            }
+            else if (state_ == GameState::CRASHED) {
+                if (elapsedMs >= CRASH_DISPLAY_MS) {
+                    prepareNextRound();
                 }
-                i = j + 1;
             }
         }
 
-        // Build Crash + Top 10 Leaderboard Broadcast JSON
-        std::ostringstream oss;
-        oss << R"({"type":"CRASH","crashPoint":)" << std::fixed << std::setprecision(2)
-            << current_multiplier_ << R"(,"reason":")" << reason
-            << R"(","serverSeed":")" << server_seed_
-            << R"(","totalWinners":)" << W << R"(,"leaderboard":[)";
+        if (!broadcastMsg.empty()) {
+            broadcast(broadcastMsg);
+        }
+    }
 
-        size_t top_n = std::min<size_t>(10, W);
-        for (size_t idx = 0; idx < top_n; ++idx) {
-            const auto& p = players_[cashouts_[idx].player_id];
-            if (idx > 0) oss << ",";
-            oss << R"({"rank":)" << p.final_rank
-                << R"(,"playerId":")" << p.player_id
-                << R"(","mult":)" << p.cashout_multiplier
-                << R"(,"prize":)" << p.prize_won << "}";
+    // Weighted Score Pool-Share Settlement + Microsecond Tie-Breaking
+    std::string settleAndCrash(double finalCrashMult) {
+        state_ = GameState::CRASHED;
+        phaseStart_ = std::chrono::steady_clock::now();
+        currentMultiplier_ = finalCrashMult;
+
+        double distributablePool = totalPool_ * POOL_PAYOUT_RATE;
+        std::vector<PlayerEntry*> winners;
+        double totalWinnerScore = 0.0;
+
+        for (auto& kv : players_) {
+            if (kv.second.cashedOut) {
+                kv.second.score = kv.second.betAmount * kv.second.cashoutMultiplier;
+                totalWinnerScore += kv.second.score;
+                winners.push_back(&kv.second);
+            }
+        }
+
+        // Rank by highest Weighted Score, tie-break by earliest microsecond cashout
+        std::sort(winners.begin(), winners.end(), [](const PlayerEntry* a, const PlayerEntry* b) {
+            if (std::abs(a->score - b->score) > 1e-6) {
+                return a->score > b->score;
+            }
+            return a->cashoutTimeMicros < b->cashoutTimeMicros;
+        });
+
+        for (size_t i = 0; i < winners.size(); ++i) {
+            winners[i]->rank = static_cast<int>(i + 1);
+            if (totalWinnerScore > 0.0 && distributablePool > 0.0) {
+                double share = (winners[i]->score / totalWinnerScore) * distributablePool;
+                winners[i]->prizeWon = std::floor(share * 100.0) / 100.0;
+            }
+        }
+
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(2)
+            << R"({"type":"CRASH","roundId":)" << roundId_
+            << R"(,"crashPoint":)" << finalCrashMult
+            << R"(,"serverSeed":")" << serverSeed_ << R"(")"
+            << R"(,"totalPool":)" << totalPool_
+            << R"(,"prizePool":)" << distributablePool
+            << R"(,"totalWinnerScore":)" << totalWinnerScore
+            << R"(,"totalWinners":)" << winners.size()
+            << R"(,"leaderboard":[)";
+
+        size_t limit = std::min<size_t>(15, winners.size());
+        for (size_t i = 0; i < limit; ++i) {
+            if (i > 0) oss << ",";
+            oss << R"({"rank":)" << winners[i]->rank
+                << R"(,"playerId":")" << winners[i]->playerId
+                << R"(","bet":)" << winners[i]->betAmount
+                << R"(,"mult":)" << winners[i]->cashoutMultiplier
+                << R"(,"score":)" << winners[i]->score
+                << R"(,"prize":)" << winners[i]->prizeWon << "}";
         }
         oss << "]}";
         return oss.str();
     }
+
+    void broadcast(const std::string& msg);
+
+    net::steady_timer timer_;
+    std::mutex mtx_;
+    std::vector<std::shared_ptr<Session>> sessions_;
+
+    uint64_t roundId_ = 0;
+    GameState state_ = GameState::WAITING;
+    std::chrono::steady_clock::time_point phaseStart_;
+
+    std::string serverSeed_;
+    std::string hashCommitment_;
+    double cryptoCrashPoint_ = 1.00;
+    double currentMultiplier_ = 1.00;
+    double totalPool_ = 0.0;
+
+    std::unordered_map<std::string, PlayerEntry> players_;
 };
 
-// ============================================================================
-// WEBSOCKET SESSION HANDLER
-// ============================================================================
+// --- WEBSOCKET SESSION ---
 class Session : public std::enable_shared_from_this<Session> {
 public:
     Session(tcp::socket&& socket, GameEngine& engine)
@@ -416,70 +376,66 @@ public:
 
     void run() {
         ws_.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
-        ws_.async_accept(beast::bind_front_handler(&Session::on_accept, shared_from_this()));
-    }
-
-    void send(const std::string& message) {
-        net::post(ws_.get_executor(), [self = shared_from_this(), message]() {
-            bool write_in_progress = !self->write_queue_.empty();
-            self->write_queue_.push_back(message);
-            if (!write_in_progress) {
-                self->do_write();
+        ws_.async_accept([self = shared_from_this()](beast::error_code ec) {
+            if (!ec) {
+                self->engine_.joinSession(self);
+                self->doRead();
             }
         });
     }
 
+    void send(const std::string& msg) {
+        net::post(ws_.get_executor(), [self = shared_from_this(), msg]() {
+            bool writing = !self->outbox_.empty();
+            self->outbox_.push_back(msg);
+            if (!writing) self->doWrite();
+        });
+    }
+
 private:
+    void doRead() {
+        ws_.async_read(buffer_, [self = shared_from_this()](beast::error_code ec, std::size_t) {
+            if (ec) {
+                self->engine_.leaveSession(self);
+                return;
+            }
+            std::string msg = beast::buffers_to_string(self->buffer_.data());
+            self->buffer_.consume(self->buffer_.size());
+
+            std::string reply = self->engine_.handleCommand(msg);
+            self->send(reply);
+            self->doRead();
+        });
+    }
+
+    void doWrite() {
+        ws_.async_write(net::buffer(outbox_.front()), [self = shared_from_this()](beast::error_code ec, std::size_t) {
+            if (ec) {
+                self->engine_.leaveSession(self);
+                return;
+            }
+            self->outbox_.erase(self->outbox_.begin());
+            if (!self->outbox_.empty()) self->doWrite();
+        });
+    }
+
     websocket::stream<beast::tcp_stream> ws_;
-    GameEngine& engine_;
     beast::flat_buffer buffer_;
-    std::vector<std::string> write_queue_;
-
-    void on_accept(beast::error_code ec) {
-        if (ec) return;
-        engine_.join_session(shared_from_this());
-        do_read();
-    }
-
-    void do_read() {
-        ws_.async_read(buffer_, beast::bind_front_handler(&Session::on_read, shared_from_this()));
-    }
-
-    void on_read(beast::error_code ec, std::size_t) {
-        if (ec) {
-            engine_.leave_session(shared_from_this());
-            return;
-        }
-        std::string msg = beast::buffers_to_string(buffer_.data());
-        buffer_.consume(buffer_.size());
-
-        std::string reply = engine_.handle_client_message(msg);
-        if (!reply.empty()) {
-            send(reply);
-        }
-        do_read();
-    }
-
-    void do_write() {
-        ws_.async_write(net::buffer(write_queue_.front()),
-                        beast::bind_front_handler(&Session::on_write, shared_from_this()));
-    }
-
-    void on_write(beast::error_code ec, std::size_t) {
-        if (ec) {
-            engine_.leave_session(shared_from_this());
-            return;
-        }
-        write_queue_.erase(write_queue_.begin());
-        if (!write_queue_.empty()) {
-            do_write();
-        }
-    }
+    std::vector<std::string> outbox_;
+    GameEngine& engine_;
 };
 
-// ============================================================================
-// TCP LISTENER & 50MS BROADCAST LOOP
-// ============================================================================
+void GameEngine::broadcast(const std::string& msg) {
+    std::vector<std::shared_ptr<Session>> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        snapshot = sessions_;
+    }
+    for (auto& s : snapshot) {
+        s->send(msg);
+    }
+}
+
 class Listener : public std::enable_shared_from_this<Listener> {
 public:
     Listener(net::io_context& ioc, tcp::endpoint endpoint, GameEngine& engine)
@@ -490,52 +446,33 @@ public:
         acceptor_.listen(net::socket_base::max_listen_connections);
     }
 
-    void run() { do_accept(); }
+    void run() { doAccept(); }
 
 private:
+    void doAccept() {
+        acceptor_.async_accept(net::make_strand(ioc_), [self = shared_from_this()](beast::error_code ec, tcp::socket socket) {
+            if (!ec) {
+                std::make_shared<Session>(std::move(socket), self->engine_)->run();
+            }
+            self->doAccept();
+        });
+    }
+
     net::io_context& ioc_;
     tcp::acceptor acceptor_;
     GameEngine& engine_;
-
-    void do_accept() {
-        acceptor_.async_accept(net::make_strand(ioc_),
-                               [self = shared_from_this()](beast::error_code ec, tcp::socket socket) {
-                                   if (!ec) {
-                                       std::make_shared<Session>(std::move(socket), self->engine_)->run();
-                                   }
-                                   self->do_accept();
-                               });
-    }
 };
 
-void schedule_tick(net::steady_timer& timer, GameEngine& engine) {
-    timer.expires_after(std::chrono::milliseconds(TICK_INTERVAL_MS));
-    timer.async_wait([&timer, &engine](const beast::error_code& ec) {
-        if (ec) return;
-        std::string broadcast_msg = engine.tick();
-        if (!broadcast_msg.empty()) {
-            for (auto& session : engine.get_sessions_snapshot()) {
-                session->send(broadcast_msg);
-            }
-        }
-        schedule_tick(timer, engine);
-    });
-}
-
 int main() {
-    const char* port_env = std::getenv("PORT");
-    unsigned short port = port_env ? static_cast<unsigned short>(std::stoi(port_env)) : 8080;
+    const char* portEnv = std::getenv("PORT");
+    unsigned short port = portEnv ? static_cast<unsigned short>(std::stoi(portEnv)) : 8080;
 
     net::io_context ioc{1};
-    GameEngine engine;
+    GameEngine engine(ioc);
+    engine.start();
 
-    auto listener = std::make_shared<Listener>(ioc, tcp::endpoint{tcp::v4(), port}, engine);
-    listener->run();
-
-    net::steady_timer tick_timer(ioc);
-    schedule_tick(tick_timer, engine);
-
-    std::cout << "[Pulse8 C++ Engine] Listening on port " << port << " (50ms tick loop active)\n";
+    std::make_shared<Listener>(ioc, tcp::endpoint{tcp::v4(), port}, engine)->run();
+    std::cout << "[Pulse8 C++ Engine] Weighted Pool-Share + 5% Dynamic Cap running on port " << port << std::endl;
     ioc.run();
     return 0;
 }
